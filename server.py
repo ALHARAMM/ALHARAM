@@ -316,11 +316,14 @@ def tool_by_id(i): return TOOLS_BY_ID.get(i)
 JOBS = {}; JOBS_LOCK = threading.Lock()
 
 class LiveLog(list):
-    """A line list that also appends every line to a .txt file the instant it is
-    produced — so each output is saved to disk live, line by line."""
+    """Line list that also streams every line to a .txt file the instant it is
+    produced. Keeps only the most recent CAP lines in memory (the FULL output is
+    always in the file) so huge scans never bloat RAM. `base` = number of lines
+    already dropped from the front, so /api/output can index absolutely."""
+    CAP = 3000
     def __init__(self, path):
         super().__init__()
-        self.path = str(path)
+        self.path = str(path); self.base = 0
         try: self._fh = open(path, "a", buffering=1, encoding="utf-8")   # line-buffered
         except Exception: self._fh = None
     def append(self, item):
@@ -328,6 +331,9 @@ class LiveLog(list):
         if self._fh:
             try: self._fh.write(str(item) + "\n"); self._fh.flush()
             except Exception: pass
+        if len(self) > self.CAP + 800:          # trim in chunks to bound memory
+            drop = len(self) - self.CAP
+            del self[:drop]; self.base += drop
 
 def _new_job(label):
     jid = uuid.uuid4().hex[:12]
@@ -351,8 +357,7 @@ def start_job(command, label=None):
                                  text=True, bufsize=1, executable="/bin/bash", cwd=str(BASE))
             job["proc"] = p
             for line in iter(p.stdout.readline, ""):
-                job["lines"].append(line.rstrip("\n"))
-                if len(job["lines"]) > 8000: del job["lines"][:len(job["lines"])-6000]
+                job["lines"].append(line.rstrip("\n"))   # LiveLog self-caps memory
             p.stdout.close(); job["rc"] = p.wait()
         except Exception as e:
             job["lines"].append(f"[!] error: {e}"); job["rc"] = -1
@@ -634,7 +639,8 @@ class AutoPentest:
         live=LOOT_DIR/f"live_{re.sub(r'[^0-9]','_',subnet)}_{datetime.now():%H%M%S}.txt"
         live.write_text("\n".join(hosts)+"\n")
         self.ai(f"{len(hosts)} live host(s) saved -> {live.relative_to(BASE)}")
-        for h in hosts: self.log("   + "+h)
+        for h in hosts[:60]: self.log("   + "+h)
+        if len(hosts)>60: self.log(f"   + ...and {len(hosts)-60} more (full list in {live.name})")
         if self.profile in ("masscan","full","net-pentest"):
             self.ai(f"masscan -- all TCP ports on {len(hosts)} live host(s)")
             mout=self.run(f"sudo masscan -iL {live} -p0-65535 --rate 1000 --open-only", timeout=1500)
@@ -897,8 +903,14 @@ class H(BaseHTTPRequestHandler):
         if path=="/api/output":
             jid=(q.get("job") or [""])[0]; pos=int((q.get("pos") or ["0"])[0]); job=JOBS.get(jid)
             if not job: return self._send(404,{"error":"no such job"})
-            lines=job["lines"][pos:]
-            return self._send(200,{"lines":lines,"pos":pos+len(lines),"done":job["done"],"rc":job["rc"],"report":job.get("report")})
+            lo=job["lines"]; base=getattr(lo,"base",0); total=base+len(lo)
+            skipped = pos < base                    # client fell behind the memory window
+            idx = max(0, pos-base)
+            chunk = lo[idx:]
+            if len(chunk) > 1500:                   # cap payload; keep newest, note the gap
+                chunk = chunk[-1500:]; skipped = True
+            return self._send(200,{"lines":chunk,"pos":total,"skipped":skipped,
+                                   "done":job["done"],"rc":job["rc"],"report":job.get("report")})
         if path=="/api/jobs":
             return self._send(200,{"jobs":[{"id":k,"label":v["label"],"done":v["done"]} for k,v in JOBS.items()]})
         if path=="/api/reports":
